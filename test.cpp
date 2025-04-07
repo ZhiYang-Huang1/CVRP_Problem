@@ -12,6 +12,7 @@
 #include <map>
 #include <chrono>
 #include <unordered_set>
+#include <mutex>
 
 using namespace std;
 
@@ -61,18 +62,20 @@ private:
     bool useLocalSearch;  // 是否启用局部搜索
     int maxLocalSearchIterations;  // 局部搜索最大迭代次数
 
-    // 添加评估计数器
+    // 评估计数器
     int evaluationCount;
     int maxEvaluations;
-
+    std::mutex evaluationMutex; // 添加互斥锁保护计数器
+    Ant currentAnt;
 public:
+    Ant bestAnt;
     CVRP() : rng(chrono::high_resolution_clock::now().time_since_epoch().count()), dist(0.0, 1.0) {
-        antCount = 25;                // 减少蚂蚁数量，提高效率
-        maxIterations = 1000;
+        antCount = 15;                // 减少蚂蚁数量，提高效率
+        maxIterations = 10000;
         alpha = 1.0;
-        beta = 2.5;                   // 增加启发式信息权重
+        beta = 4;                   // 增加启发式信息权重
         rho = 0.1;
-        q0 = 0.9;                     // 增加利用率
+        q0 = 0.1;                     // 增加利用率
         depot = 1;
         useLocalSearch = true;        // 启用局部搜索
         maxLocalSearchIterations = 100;
@@ -81,7 +84,12 @@ public:
         evaluationCount = 0;
         maxEvaluations = 50000;
     }
-
+    Ant getCurrentAnt() const {
+        return currentAnt;
+    }
+    double getCurrentSolutionCost() const {
+        return currentAnt.totalDistance;
+    }
     bool readInstance(const string& filename) {
         ifstream file(filename);
         if (!file.is_open()) {
@@ -165,7 +173,7 @@ public:
     }
 
     void initializeMatrices() {
-        // 使用最近邻启发式计算初始信息素值
+        // 使用最近邻启发式计算初始信息素值(贪心算法）
         double totalDist = 0.0;
         vector<bool> visited(dimension + 1, false);
         visited[depot] = true;
@@ -194,8 +202,8 @@ public:
         totalDist += distances[current][depot];  // 返回仓库
 
         // 初始信息素值
-        //double initialPheromone = 1.0 / (dimension * totalDist);
-        double initialPheromone = antCount / (totalDist);
+        double initialPheromone = 1.0 / (dimension * totalDist);
+        /* double initialPheromone = antCount / (totalDist);*/
 
         pheromone.resize(dimension + 1, vector<double>(dimension + 1, initialPheromone));
         heuristic.resize(dimension + 1, vector<double>(dimension + 1, 0.0));
@@ -227,47 +235,85 @@ public:
         }
     }
 
+    // 添加一个安全的增加评估计数的方法
+    bool incrementEvaluation(int count = 1) {
+        std::lock_guard<std::mutex> lock(evaluationMutex);
+        if (evaluationCount + count >= maxEvaluations) {
+            evaluationCount = maxEvaluations;
+            return false; // 返回false表示已达到最大评估次数
+        }
+        evaluationCount += count;
+        return true; // 返回true表示可以继续
+    }
+
+    // 添加一个检查是否达到最大评估次数的方法
+    bool reachedMaxEvaluations() {
+        std::lock_guard<std::mutex> lock(evaluationMutex);
+        return evaluationCount >= maxEvaluations;
+    }
+
     void solve() {
         auto startTime = chrono::high_resolution_clock::now();
 
-        Ant bestAnt;
+
         bestAnt.totalDistance = numeric_limits<double>::max();
 
-        // 迭代计数器和无改进计数器
         int noImprovementCount = 0;
 
+        // 预留一些评估次数给最后的处理
+        const int reservedEvaluations = 100;
+        const int effectiveMaxEvaluations = maxEvaluations - reservedEvaluations;
+
         for (int iter = 0; iter < maxIterations; iter++) {
-            // 检查是否达到最大评估次数
-            if (evaluationCount >= maxEvaluations) {
-                cout << "Reached maximum evaluation count: " << maxEvaluations << endl;
+            // 检查是否接近最大评估次数
+            if (evaluationCount >= effectiveMaxEvaluations) {
+                cout << "Approaching maximum evaluation count: " << maxEvaluations << endl;
                 break;
             }
 
-            vector<Ant> ants(antCount);
+            // 计算本次迭代最多可用的评估次数
+            int availableEvaluations = effectiveMaxEvaluations - evaluationCount;
+            int antsToProcess = min(antCount, availableEvaluations);
 
-            // 并行构建解决方案
+            if (antsToProcess <= 0) {
+                cout << "No more evaluations available" << endl;
+                break;
+            }
+
+            vector<Ant> ants(antsToProcess);
+
 #pragma omp parallel for
-            for (int k = 0; k < antCount; k++) {
-                constructSolution(ants[k]);
+            for (int k = 0; k < antsToProcess; k++) {
+                // 在处理每只蚂蚁前检查评估次数
+                if (!reachedMaxEvaluations()) {
+                    constructSolution(ants[k]);
 
-                // 增加评估计数
-#pragma omp atomic
-                evaluationCount += 1;
+                    // 增加评估计数
+#pragma omp critical
 
-                // 局部搜索优化
-                if (useLocalSearch) {
-                    localSearch(ants[k]);
+                    // 在进行局部搜索前再次检查评估次数
+                    if (!reachedMaxEvaluations() && useLocalSearch) {
+                        localSearch(ants[k]);
+                    }
                 }
             }
 
+            // 如果已达到最大评估次数，跳出循环
+            if (reachedMaxEvaluations()) {
+                cout << "Reached maximum evaluation count during iteration " << iter << endl;
+                break;
+            }
+
             // 找出本次迭代最佳蚂蚁
+            if (ants.empty()) break;
+
             Ant* iterationBest = &ants[0];
-            for (int k = 1; k < antCount; k++) {
+            for (int k = 1; k < ants.size(); k++) {
                 if (ants[k].totalDistance < iterationBest->totalDistance) {
                     iterationBest = &ants[k];
                 }
             }
-
+            currentAnt = *iterationBest;
             // 更新全局最佳解
             bool improved = false;
             if (iterationBest->totalDistance < bestAnt.totalDistance) {
@@ -286,28 +332,19 @@ public:
             // 更新信息素
             updatePheromone(ants, bestAnt);
 
-            // 每100次迭代输出当前最佳解
-            if (iter % 100 == 0) {
-                cout << "Iteration " << iter << ": Current best distance = " << bestAnt.totalDistance
-                    << ", vehicles = " << bestAnt.usedVehicles << endl;
-
-                // 计算并显示运行时间
-                auto currentTime = chrono::high_resolution_clock::now();
-                auto duration = chrono::duration_cast<chrono::seconds>(currentTime - startTime).count();
-                cout << "Time elapsed: " << duration << " seconds" << endl;
-            }
-
-            // 如果长时间没有改进，动态调整参数
-            if (noImprovementCount > 200) {
-                q0 = max(0.5, q0 - 0.05);  // 增加探索
-                noImprovementCount = 0;
-                cout << "No improvement for 200 iterations, adjusting q0 to " << q0 << endl;
+            // 输出当前评估次数
+            if (iter % 10 == 0) {
+                cout << "Iteration " << iter << ": Current evaluations = " << evaluationCount << "/" << maxEvaluations << endl;
             }
         }
+
+        // 输出最终评估次数
+        cout << "Total evaluations: " << evaluationCount << endl;
 
         // 计算总运行时间
         auto endTime = chrono::high_resolution_clock::now();
         auto duration = chrono::duration_cast<chrono::seconds>(endTime - startTime).count();
+        cout << "Total time: " << duration << " seconds" << endl;
 
         // 输出最终结果
         cout << "\nFinal Results:" << endl;
@@ -328,11 +365,7 @@ public:
             cout << endl;
         }
 
-        // 输出最终评估次数
-        cout << "Total evaluations: " << evaluationCount << endl;
 
-        // 保存结果到文件
-        saveResult(bestAnt);
     }
 
     void constructSolution(Ant& ant) {
@@ -363,7 +396,7 @@ public:
                 currentNode = nextNode;
 
                 // 局部信息素更新
-                pheromone[currentNode][nextNode] = (1 - rho) * pheromone[currentNode][nextNode] + rho * (1.0 / (dimension * 10));
+                pheromone[currentNode][nextNode] = (1 - rho) * pheromone[currentNode][nextNode] + rho * (1.0 / (dimension * 100));
                 pheromone[nextNode][currentNode] = pheromone[currentNode][nextNode];  // 对称更新
 
                 // 更新预计算的幂值
@@ -372,6 +405,9 @@ public:
             }
 
             ant.routes.push_back(route);
+            if (!incrementEvaluation(1)) {
+                return;
+            }
         }
 
         // 计算总距离
@@ -455,38 +491,42 @@ public:
         bool improved = true;
         int iterations = 0;
 
-        while (improved && iterations < maxLocalSearchIterations) {
-            // 检查是否达到最大评估次数
-            if (evaluationCount >= maxEvaluations) {
-                return;
-            }
+        // 为局部搜索预留的最大评估次数
+        const int maxLocalSearchEvals = 500;
+        int localSearchEvals = 0;
 
+        while (improved && iterations < maxLocalSearchIterations && localSearchEvals < maxLocalSearchEvals) {
+
+
+            localSearchEvals++;
             improved = false;
             iterations++;
 
-            // 增加评估计数
-            evaluationCount += 1;
-
             // 2-opt 优化每条路径
-            for (auto& route : ant.routes) {
-                if (route.size() <= 4) continue;  // 路径太短，不需要优化
+            //for (auto& route : ant.routes) {
+            //    if (route.size() <= 4) continue;  // 路径太短，不需要优化
 
-                for (int i = 1; i < route.size() - 2; i++) {
-                    for (int j = i + 1; j < route.size() - 1; j++) {
-                        // 计算当前路径段的距离
-                        double currentDist = distances[route[i - 1]][route[i]] + distances[route[j]][route[j + 1]];
+            //    for (int i = 1; i < route.size() - 2; i++) {
+            //        for (int j = i + 1; j < route.size() - 1; j++) {
+            //            // 计算当前路径段的距离
+            //           
+            //            if (!incrementEvaluation(1)) {
+            //                return;
+            //            }
 
-                        // 计算交换后的距离
-                        double newDist = distances[route[i - 1]][route[j]] + distances[route[i]][route[j + 1]];
+            //            double currentDist = distances[route[i - 1]][route[i]] + distances[route[j]][route[j + 1]];
 
-                        if (newDist < currentDist) {
-                            // 反转子路径
-                            reverse(route.begin() + i, route.begin() + j + 1);
-                            improved = true;
-                        }
-                    }
-                }
-            }
+            //            // 计算交换后的距离
+            //            double newDist = distances[route[i - 1]][route[j]] + distances[route[i]][route[j + 1]];
+
+            //            if (newDist < currentDist) {
+            //                // 反转子路径
+            //                reverse(route.begin() + i, route.begin() + j + 1);
+            //                improved = true;
+            //            }
+            //        }
+            //    }
+            //}
 
             // 尝试在路径之间移动客户
             if (ant.routes.size() > 1) {
@@ -515,6 +555,7 @@ public:
 
                             // 尝试将客户插入路径2的每个可能位置
                             for (int j = 1; j < route2.size(); j++) {
+
                                 double costRoute2 = distances[route2[j - 1]][customer] + distances[customer][route2[j]] - distances[route2[j - 1]][route2[j]];
 
                                 if (savingRoute1 > costRoute2) {
@@ -525,6 +566,9 @@ public:
                                     // 更新路径2的剩余容量
                                     route2RemainingCapacity -= nodes[customer].demand;
 
+                                    if (!incrementEvaluation(1)) {
+                                        return;
+                                    }
                                     improved = true;
                                     break;
                                 }
@@ -549,6 +593,11 @@ public:
                     }
                 }
                 ant.totalDistance = totalDist;
+            }
+
+            // 在每次重要操作后检查评估次数
+            if (reachedMaxEvaluations()) {
+                return;
             }
         }
 
@@ -587,51 +636,110 @@ public:
         updatePowerMatrices();
     }
 
-    void saveResult(const Ant& ant) {
-        size_t pos = instanceName.find_last_of("/\\");
-        string name = (pos == string::npos) ? instanceName : instanceName.substr(pos + 1);
-        name = name.substr(0, name.find_last_of('.'));
 
-        string filename = name + ".sol";
-        ofstream file(filename);
-
-        if (!file.is_open()) {
-            cerr << "Cannot create result file: " << filename << endl;
-            return;
-        }
-
-        for (int i = 0; i < ant.routes.size(); i++) {
-            file << "Route #" << (i + 1) << ":";
-            // 不输出起点和终点的仓库
-            for (int j = 1; j < ant.routes[i].size() - 1; j++) {
-                file << " " << ant.routes[i][j];
-            }
-            file << endl;
-        }
-
-        file << "Cost " << fixed << setprecision(0) << ant.totalDistance << endl;
-        file.close();
-
-        cout << "Results saved to: " << filename << endl;
-    }
 };
 
 int main() {
-    // 在这里手动指定要运行的实例文件
-    string instanceFile = "A-n33-k5.vrp";  // 修改这里来运行不同的实例
+    // 手动列出所有.vrp文件路径
+    std::vector<string> instances = {
+     "A-n32-k5.vrp",
+     "A-n33-k5.vrp",
+     "A-n33-k6.vrp",
+     "A-n34-k5.vrp",
+     "A-n36-k5.vrp",
+     "A-n37-k5.vrp",
+     "A-n37-k6.vrp",
+     "A-n38-k5.vrp",
+     "A-n39-k5.vrp",
+     "A-n39-k6.vrp",
+     "A-n44-k6.vrp",
+     "A-n45-k6.vrp",
+     "A-n45-k7.vrp",
+     "A-n46-k7.vrp",
+     "A-n48-k7.vrp",
+     "A-n53-k7.vrp",
+     "A-n54-k7.vrp",
+     "A-n55-k9.vrp",
+      "A-n60-k9.vrp",
+      "A-n61-k9.vrp",
+      "A-n62-k8.vrp",
+      "A-n63-k9.vrp",
+      "A-n63-k10.vrp",
+      "A-n64-k9.vrp",
+     "A-n65-k9.vrp",
+     "A-n69-k9.vrp",
+     "A-n80-k10.vrp",
+    };
+    // 打开CSV文件
+    std::ofstream csv("蚁群.csv");
 
-    cout << "Processing instance: " << instanceFile << endl;
-
-    CVRP cvrp;
-    if (cvrp.readInstance(instanceFile)) {
-        cvrp.solve();
+    // 写入CSV文件头
+    csv << "Instance";
+    for (int run = 1; run <= 25; ++run) {
+        csv << ",Run " << run << " Cost";
     }
-    else {
-        cout << "Cannot read instance file, please check if the path is correct" << endl;
+    csv << ",Average Cost,Average Time (s)\n";
+
+    // 顺序执行所有实例
+    for (const auto& instance : instances) {
+        double totalCost = 0;
+        double totalTime = 0;
+      
+
+        // 写入实例名称
+        csv << instance;
+
+        // 运行25次
+        for (int run = 0; run < 25; ++run) {
+            CVRP cvrp;
+
+            // 读取问题数据
+            if (!cvrp.readInstance(instance)) {
+                std::cerr << "Failed to read input file: " << instance << std::endl;
+                continue;
+            }
+
+            // 计时开始
+            auto startTime = std::chrono::high_resolution_clock::now();
+
+            // 运行算法
+            cvrp.solve();
+
+            // 计时结束
+            auto endTime = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+            double timeSeconds = duration / 1000.0;
+
+            // 获取当前运行的结果
+            double currentCost = cvrp.bestAnt.totalDistance; // 获取当前解的成本
+            totalCost += currentCost;
+            totalTime += timeSeconds;
+
+
+
+            // 输出当前运行的结果
+            std::cout << "Run " << run + 1 << " for " << instance
+                << " Cost: " << currentCost
+                << " Time: " << timeSeconds << "s" << std::endl;
+
+            // 将当前运行的结果写入CSV文件
+            csv << "," << currentCost;
+        }
+        double avgCost = totalCost / 25;
+        double avgTime = totalTime / 25;
+
+        // 将平均值写入CSV文件
+        csv << "," << avgCost << "," << avgTime << "\n";
+
+        // 输出实例的平均结果
+        std::cout << "Finished: " << instance
+            << " Avg Cost: " << avgCost
+            << " Avg Time: " << avgTime << "s" << std::endl;
+
+
+
     }
 
-    cout << "Press any key to continue..." << endl;
-    getchar();
-
+    csv.close();
     return 0;
 }
